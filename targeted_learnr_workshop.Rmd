@@ -1,0 +1,474 @@
+---
+title: "targeted_learnr vignette"
+author: "Andrew Mertens"
+date: "2025-02-16"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+###"Safety Analysis Workshop: HCV Treatment and AKI using TMLE"
+
+I will create a step-by-step R Markdown vignette that guides students through a full safety analysis using the causal inference roadmap and TMLE, mirroring the causalRisk package functionality while adding enhancements from the tlverse framework. This vignette will include:
+
+Simulated HCV and AKI data reflecting the structure of the data used in the provided report.
+A complete workflow for causal inference using TMLE and SuperLearner.
+Diagnostic plots and visualizations, both replicating causalRisk outputs and showcasing additional strengths of TMLE.
+Interpretation questions for students, with explanations provided.
+Wrapper functions to mimic causalRisk functionality within the tlverse ecosystem.
+Sensitivity analyses as optional exercises for students.
+I’ll notify you once the vignette is ready for your review.
+
+
+# Introduction
+
+Real-world evidence (RWE) often raises **safety questions**: does a treatment cause adverse outcomes? In this workshop, we will use a **causal inference roadmap** to analyze a safety outcome using **Targeted Maximum Likelihood Estimation (TMLE)**. Our example explores whether a new Hepatitis C (HCV) treatment increases the risk of acute kidney injury (AKI). We will simulate data mirroring an HCV-AKI study and guide you through:
+
+- Formulating a **causal question** and choosing an **estimand** (e.g. risk difference).
+- Outlining identification assumptions (no unmeasured confounding, positivity, etc.).
+- Using the **tlverse** framework (TMLE + SuperLearner) for estimation.
+- Writing simple **wrapper functions** (mimicking the `causalRisk` package) to run TMLE and format results.
+- Producing **descriptive tables** and **diagnostic plots** (e.g. propensity score overlap) to check assumptions.
+- **Interpreting results** with guided questions and answers.
+- Optional **exercises** for further exploration (e.g. comparing methods, testing sensitivity).
+
+We assume you have intermediate R skills but are new to TMLE/SuperLearner. Let's get started!
+
+## Data Setup: Simulating an HCV Treatment & AKI Dataset
+
+First, we simulate a dataset resembling an HCV safety study. Imagine a cohort of chronic HCV patients where a new **direct-acting antiviral (DAA)** treatment (e.g. a sofosbuvir-based regimen) became available. We're interested in the treatment's effect on **6-month AKI incidence**. 
+
+**Population and Variables:** Each patient has baseline characteristics (`W`), a treatment indicator `A` (1 = received DAA, 0 = did not), and an outcome `Y` (1 = AKI within 6 months, 0 = no AKI). Key baseline covariates might include:
+- `age` (in years)
+- `diabetes` (1 = has diabetes, 0 = no)
+- `CKD` (1 = baseline chronic kidney disease or reduced renal function, 0 = normal)
+
+These `W` covariates are potential **confounders**: they may influence both treatment decision and risk of AKI. For example, physicians may avoid the new DAA in patients with pre-existing CKD due to safety concerns, and those patients are inherently at higher risk of AKI. This could **confound** the treatment-AKI relationship.
+
+**Simulate the data:** We'll create a sample of patients, simulate `W`, then assign treatment probabilities biased by `W` (to reflect confounding), and finally simulate AKI outcomes influenced by both `W` and `A`. We set a true causal effect where the treatment slightly *increases* AKI risk (as might be suspected for a nephrotoxic side effect), even though treated patients are generally healthier at baseline.
+
+```{r}
+# Load required packages
+library(tmle)
+library(SuperLearner)
+library(ggplot2)
+set.seed(123)  # for reproducibility
+
+# Simulate sample data
+n <- 2000
+data <- data.frame(
+  age      = rnorm(n, mean = 50, sd = 10),       # age in years
+  diabetes = rbinom(n, 1, prob = 0.3),           # 30% have diabetes
+  CKD      = rbinom(n, 1, prob = 0.2)            # 20% have baseline CKD
+)
+
+# Treatment assignment model (propensity score) depends on W (confounding):
+# Assume doctors less likely to give new DAA to older, diabetic, or CKD patients.
+logit_A <- -1.0 
+logit_A <- logit_A - 0.5 * data$diabetes  - 1.0 * data$CKD  - 0.01 * data$age 
+data$propensity <- plogis(logit_A)  # P(A=1|W)
+data$A <- rbinom(n, 1, prob = data$propensity)  # assign treatment
+
+# Outcome model:
+# Baseline logit for AKI risk influenced by diabetes, CKD, age.
+logit_Y0 <- -2.5 + 0.8 * data$diabetes + 1.2 * data$CKD + 0.02 * (data$age - 50)
+# Add a true treatment effect (on log-odds) of +0.3 if treated (increases AKI risk).
+logit_Y1 <- logit_Y0 + 0.3  
+# Simulate potential outcomes Y(0) and Y(1) for each individual:
+prob_Y0 <- plogis(logit_Y0)  # AKI probability if untreated
+prob_Y1 <- plogis(logit_Y1)  # AKI probability if treated
+# Realized outcome Y based on actual treatment A:
+data$Y <- rbinom(n, 1, prob = ifelse(data$A == 1, prob_Y1, prob_Y0))
+
+```
+In the code above, we ensured:
+
+Confounding: Patients with CKD or diabetes (higher AKI risk) have lower probability of receiving A=1 (new treatment). Thus, treated patients tend to be healthier.
+Causal effect: Treatment has a modest harmful effect on AKI (increases log-odds by 0.3). This corresponds to about an 11-12% relative increase in risk (e.g., if baseline risk is 10%, treated risk ~11.1%).
+Now let's examine the simulated data structure and verify these patterns:
+
+```{r}
+
+# Peek at the first few rows
+head(data, 5)
+# Summary statistics
+mean(data$A)        # overall treatment probability
+mean(data$Y)        # overall AKI incidence
+table(data$A, data$Y)  # cross-tabulation of treatment vs outcome counts
+
+```
+
+You should see around ~20-30% treated (depending on how many had risk factors) and an overall AKI incidence of maybe ~15%. The cross-tabulation shows how many patients in each group had AKI. We expect:
+
+Fewer treated patients have CKD/diabetes (by construction).
+Treated patients might show lower raw AKI incidence because they were healthier, despite the treatment's harmful effect.
+Untreated patients include more high-risk individuals, likely yielding higher unadjusted AKI rates.
+Let's confirm by comparing AKI rates by treatment group:
+
+```{r}
+
+# Compute 6-month AKI risk in each group (unadjusted):
+risk_treated   <- mean(data$Y[data$A == 1])  # P(Y=1 | A=1)
+risk_untreated <- mean(data$Y[data$A == 0])  # P(Y=1 | A=0)
+c(risk_treated, risk_untreated)
+
+```
+
+Question: Based on the raw proportions, which group has a higher AKI incidence? Interpret this naive comparison and why it might be misleading.
+
+Answer: You will likely find risk_treated < risk_untreated (e.g., treated ~10-12% vs untreated ~18%). Naively, it appears the treatment reduces AKI risk. However, this is misleading because of confounding: doctors tended to treat healthier patients (with lower inherent AKI risk). The treated group’s lower AKI rate may reflect their healthier profile, not a true protective effect of the drug. We need to adjust for the imbalances in baseline covariates to estimate the causal effect of treatment on AKI.
+
+Before adjusting, let's also examine baseline differences by treatment, akin to a Table 1 in study reports:
+
+```{r}
+
+# Create a simple Table 1 of baseline characteristics by treatment
+library(dplyr)
+data %>% group_by(A) %>% 
+  summarise(
+    n = n(),
+    mean_age = round(mean(age),1),
+    pct_diabetes = round(mean(diabetes)*100,1),
+    pct_CKD = round(mean(CKD)*100,1),
+    AKI_rate = round(mean(Y)*100,1)
+  )
+```
+
+This summary shows the treatment groups' sizes and characteristics:
+
+We expect A=1 group (treated) to have slightly younger patients, with lower % CKD and diabetes than A=0 (untreated).
+The AKI_rate here just reproduces our earlier risk calculation (for verification).
+Such baseline differences confirm confounding: the groups are not directly comparable. Now we formally define our causal question and how to estimate it properly.
+
+Step 1: Causal Question and Target Estimand
+Our causal question is: "Does initiating the new HCV treatment (vs. not initiating) causally affect the 6-month risk of AKI, and if so, by how much?" We need to quantify this effect in a well-defined estimand.
+
+Estimand Selection: We will use the Average Treatment Effect (ATE) on the risk of AKI at 6 months. Specifically, we focus on the risk difference: 
+ATE
+𝑅
+𝐷
+=
+𝑃
+(
+𝑌
+=
+1
+∣
+do
+(
+𝐴
+=
+1
+)
+)
+−
+𝑃
+(
+𝑌
+=
+1
+∣
+do
+(
+𝐴
+=
+0
+)
+)
+,
+ATE 
+RD
+​
+ =P(Y=1∣do(A=1))−P(Y=1∣do(A=0)), the difference in AKI probability if everyone is treated versus if no one is treated (under identical baseline conditions). This captures the absolute risk increase attributable to treatment.
+
+We could also consider a risk ratio $RR = \frac{P(Y=1\mid do(A=1))}{P(Y=1\mid do(A=0))}$ or an odds ratio, but the risk difference is often preferred for public health interpretation (it directly gives percentage-point increase in risk). For completeness, the TMLE output will provide RR and OR as well, but our primary estimand is the risk difference.
+
+Population and Timeframe: Our target population is similar to the study cohort (HCV patients eligible for treatment), and the outcome is evaluated at 6 months. We assume one can either initiate the DAA at baseline or not at all in that period (a point intervention). This simplification matches our simulated data where A is a baseline one-time decision.
+
+Causal Contrast: We compare initiating treatment vs. not initiating at time 0, keeping all else the same. This mimics a target trial: imagine we could randomize the patients to treatment or no treatment and measure 6-month AKI outcomes. The ATE (risk difference) is what that trial would estimate.
+
+Step 2: Causal Inference Roadmap – Identifying the Estimand
+To infer the causal effect from observational data, we rely on key assumptions (the causal inference roadmap):
+
+Exchangeability (No unmeasured confounding): Given our covariates W = {age, diabetes, CKD}, we assume $Y(a) \perp!!\perp A \mid W$ for $a\in{0,1}$. In words, conditional on these baseline factors, the treatment assignment is as good as random. This implies our W set captures all major confounders that affect both treatment choice and AKI risk. In a real study, we'd justify this by clinical knowledge (e.g., age, diabetes, CKD, etc., are the drivers of both who gets treated and who gets AKI).
+
+Positivity (Overlap): There is a positive probability of receiving each treatment level for each combination of covariates in the population. Every patient profile has some chance to be treated and some chance to be untreated (CAUSALWIZARD.APP). In practice, this means the propensity scores (predicted $P(A=1|W)$) range strictly between 0 and 1 for all individuals. If some patients are almost guaranteed treatment or non-treatment due to their W values, it would be hard to disentangle treatment effect for those subgroups (we would be extrapolating beyond the data).
+
+Consistency: Each patient’s observed outcome corresponds to the specified potential outcome under the treatment actually received. Essentially, we assume no interference and well-defined treatment: if a patient took the DAA, their outcome is $Y(1)$; if not, it's $Y(0)$.
+
+Given these assumptions, we can identify the causal risk difference by adjusting for W. The estimand can be expressed via the g-formula: 
+𝑃
+(
+𝑌
+=
+1
+∣
+𝑑
+𝑜
+(
+𝐴
+=
+𝑎
+)
+)
+=
+𝐸
+𝑊
+[
+ 
+𝑃
+(
+𝑌
+=
+1
+∣
+𝐴
+=
+𝑎
+,
+𝑊
+)
+ 
+]
+,
+P(Y=1∣do(A=a))=E 
+W
+​
+ [P(Y=1∣A=a,W)], and then take the difference between $a=1$ and $a=0$. This is what we'll estimate with TMLE.
+
+Before estimation, let's check positivity in our data as a diagnostic. We'll examine the distribution of propensity scores for treated vs untreated:
+
+```{r}
+
+# Calculate propensity scores (we already have the true one from simulation for illustration)
+# In practice, we'd estimate this via a model: here we use the 'propensity' we simulated.
+ps <- data$propensity
+summary(ps)
+# Overlap check: visualize propensity by treatment group
+ggplot(data, aes(x = propensity, fill = factor(A))) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5) +
+  labs(fill="Treatment", x="Propensity Score", title="Propensity Score Distribution by Treatment") +
+  theme_minimal()
+
+```
+
+The histogram (if you run the code) shows the range of propensity scores for A=0 (untreated) and A=1 (treated). We want to see good overlap: both groups should cover similar ranges of scores​
+CAUSALWIZARD.APP
+. In our simulated data, treated patients mostly have higher propensities (since healthy patients were more likely to get treated), but there is still overlap — e.g., some untreated have moderate propensity and vice versa. We have no extreme stratum with propensities 0 or 1 only, so positivity holds by design.
+
+If there were large regions of non-overlap, we might consider restricting to the overlap region or using extrapolation with caution. For now, we proceed, having checked that each subgroup of patients had a chance for either treatment.
+
+Step 3: Adjusted Analysis Plan
+Now we move to estimation. Traditional approaches might use stratification or regression (e.g., a logistic regression of $Y$ on $A$ and $W$) or IPW (inverse probability weighting) to adjust for confounders. Here, we will use Targeted Maximum Likelihood Estimation (TMLE) with SuperLearner as our estimation strategy.
+
+Why TMLE? TMLE is a doubly robust estimator: it combines an outcome model and a treatment (propensity) model to adjust for confounding. It yields consistent estimates if either model is correctly specified, and is efficient if both are correct​
+RESEARCHONLINE.LSHTM.AC.UK
+. TMLE also allows incorporating flexible machine learning for these models without sacrificing the valid interpretation of the target parameter​
+EHSANX.GITHUB.IO
+. In other words, we can use complex algorithms to model $E[Y|A,W]$ and $P(A|W)$, and TMLE will still target the causal effect in a way that gives proper confidence intervals.
+
+Why SuperLearner? SuperLearner (SL) is an ensemble machine learning method that combines multiple algorithms to optimize predictive performance. Using SL for the outcome and propensity models helps avoid mis-specification (we let the data adaptively choose the best model mix)​
+RESEARCHONLINE.LSHTM.AC.UK
+. This flexibility is a major advantage of TMLE in real-world studies, where true relationships may be nonlinear or complex.
+
+Plan: We will:
+
+Use SuperLearner to estimate the outcome regression $Q(W,A) \approx P(Y=1|A,W)$ and the propensity score $g(W) = P(A=1|W)$.
+Then apply the TMLE update (happens inside the tmle() function) to compute the adjusted risk difference and other metrics.
+We will compare the TMLE results to the crude comparison and interpret the impact of adjustment.
+Before running TMLE, let's specify the SuperLearner libraries (algorithms) for each task. For simplicity, we'll use a small library:
+
+For outcome $Q$: GLM (main terms logistic regression), a generalized additive model (gam), and a simple mean (intercept-only) model.
+For propensity $g$: GLM and a simple mean model (though mean is mostly a trivial baseline).
+Feel free to add more learners (e.g., random forest via "SL.ranger", gradient boosting via "SL.xgboost", etc.) if installed. A larger library can improve fit at the cost of computation. Here is our setup and TMLE call:
+
+```{r}
+
+# Define SuperLearner libraries for outcome and propensity models
+Q_lib <- c("SL.glm", "SL.gam", "SL.mean")       # algorithms for E[Y|A,W]
+g_lib <- c("SL.glm", "SL.mean")                 # algorithms for P(A|W)
+
+# Run TMLE to estimate ATE (risk difference, risk ratio, etc.)
+tmle_fit <- tmle(Y = data$Y, 
+                 A = data$A, 
+                 W = data[, c("age","diabetes","CKD")],
+                 Q.SL.library = Q_lib,
+                 g.SL.library = g_lib,
+                 family = "binomial")
+tmle_fit  # print results
+```
+
+The tmle() function automatically targets the ATE for a binary treatment. By printing the result, you should see estimates for:
+
+ATE (additive treatment effect): this is our risk difference.
+RR (relative risk).
+OR (odds ratio). along with their 95% confidence intervals and p-values.
+Let's extract and format the main results for clarity:
+
+```{r}
+
+# Extract TMLE results
+RD   <- tmle_fit$estimates$ATE$psi        # risk difference (absolute effect)
+RD_ci <- tmle_fit$estimates$ATE$CI        # 95% CI for risk difference
+RR   <- tmle_fit$estimates$RR$psi         # risk ratio 
+RR_ci <- tmle_fit$estimates$RR$CI         # 95% CI for risk ratio
+EY0  <- mean(tmle_fit$Qstar[,1])          # TMLE estimated P(Y=1|do(A=0))
+EY1  <- mean(tmle_fit$Qstar[,2])          # TMLE estimated P(Y=1|do(A=1))
+
+# Present results in a reader-friendly way
+cat(sprintf("Estimated 6-month AKI risk if Untreated (A=0): %.1f%%\n", 100*EY0))
+cat(sprintf("Estimated 6-month AKI risk if Treated (A=1): %.1f%%\n", 100*EY1))
+cat(sprintf("Risk Difference (ATE) = %.1f percentage points (95%% CI: %.1f, %.1f)\n", 
+            100*RD, 100*RD_ci[1], 100*RD_ci[2]))
+cat(sprintf("Risk Ratio = %.2f (95%% CI: %.2f, %.2f)\n", 
+            RR, RR_ci[1], RR_ci[2]))
+```
+
+Running the above will output something like:
+
+
+Estimated 6-month AKI risk if Untreated (A=0): XX.X%
+Estimated 6-month AKI risk if Treated (A=1): YY.Y%
+Risk Difference (ATE) = Z.Z percentage points (95% CI: LCL, UCL)
+Risk Ratio = R.RR (95% CI: LCL, UCL)
+Where you will have numeric values for these placeholders. Now let's interpret these results.
+
+Step 4: Results and Interpretation
+TMLE Estimates: The TMLE estimates represent our best guess of the causal effect:
+
+EY0 is the counterfactual AKI risk had everyone been untreated.
+EY1 is the counterfactual AKI risk had everyone been treated.
+The risk difference RD = EY1 - EY0 is the estimated increase in absolute risk due to treatment.
+The risk ratio RR = EY1 / EY0 is the multiplicative effect.
+Interpretation Example (your numbers may vary): Suppose TMLE output is:
+
+
+Untreated risk: 17.5%  
+Treated risk: 14.0%  
+Risk Difference = -3.5 pp (95% CI: -7.5, 0.5)  
+Risk Ratio = 0.80 (95% CI: 0.55, 1.01)
+This would mean after adjusting for confounders, treated patients have an estimated 14.0% risk of AKI vs 17.5% if untreated, a -3.5 percentage point difference. The confidence interval includes 0, and the risk ratio ~0.80 has CI including 1.0, suggesting no statistically significant harmful effect – in fact, point estimate suggests a potential benefit (which might indicate residual confounding or chance).
+
+However, your TMLE results might differ depending on random simulation. Recall we built in a true harmful effect of treatment (+0.3 on logit). In a large sample, we expect TMLE to detect a slight increase in risk for treated. For instance, you might see:
+
+
+Untreated risk: 15.8%  
+Treated risk: 17.5%  
+Risk Difference = +1.7 pp (95% CI: -1.0, 4.5)  
+Risk Ratio = 1.11 (95% CI: 0.93, 1.32)
+This indicates a slightly higher AKI risk with treatment (1.7 percentage-point increase, or about 11% relative increase), though the CI may still include no effect. With a larger sample or stronger effect size, we might achieve significance. The direction, however, aligns with our true data-generating mechanism that the drug was mildly nephrotoxic.
+
+Question: Compare the adjusted risk difference to the unadjusted difference from earlier. What changed and why?
+
+Answer: Initially, the crude comparison suggested treated patients had lower AKI risk than untreated, due to confounding by indication (healthier patients got treated). After adjustment via TMLE, the risk difference shifted toward positive, reflecting the drug’s actual harmful impact. The adjustment effectively controlled for age, diabetes, CKD – leveling the playing field – and thus revealed that the treatment is likely not protective. The change highlights how confounding can mask or even reverse the true effect, and why causal adjustment is critical in observational studies.
+
+Question: How do we interpret the confidence interval for the risk difference?
+
+Answer: The 95% CI for the risk difference tells us the range of plausible true effects, given the data and model. If the CI includes 0, we do not have strong evidence that the treatment affects AKI risk (the effect could be zero or even in the opposite direction). If the CI is entirely above 0, it would indicate a statistically significant increased risk; entirely below 0 would indicate a significant decreased risk. In safety analyses, even a non-significant increase may be concerning if the point estimate and upper bound suggest potential harm, warranting further investigation.
+
+Question: Why might we prefer TMLE + SuperLearner over a basic regression or weighting approach here?
+
+Answer: TMLE offers double robustness and efficiency – if either the outcome model or propensity model is correct (even if the other is wrong), TMLE can still give an unbiased estimate​
+RESEARCHONLINE.LSHTM.AC.UK
+. It also uses the propensity model information to reduce bias in the outcome model via the targeting step. SuperLearner allows us to use data-driven model selection, reducing reliance on arbitrary model assumptions and potentially improving accuracy if relationships are complex​
+RESEARCHONLINE.LSHTM.AC.UK
+. In contrast, a simple logistic regression might be mis-specified (e.g., missing nonlinear terms or interactions), leading to biased estimates. TMLE with SL mitigates that risk by considering a library of models and optimally weighting them. This flexibility is particularly useful in RWE where we often don't know the exact form of relationships.
+
+As a check, let's see which algorithms our SuperLearner chose for the outcome and propensity models. We can extract the SL weights or selected model from the tmle_fit object:
+
+```{r}
+
+tmle_fit$Qinit$coef  # coefficients for the ensemble of Q models
+tmle_fit$g$coef      # coefficients for the ensemble of g models
+```
+
+These will show the weight each algorithm got in the final ensemble (if SuperLearner combined them) or which was chosen (if it picked one discretely). For example, you might see Qinit$coef giving most weight to SL.gam or SL.glm depending on which fit best, and g$coef likely giving most weight to SL.glm if propensity is roughly linear in W. This transparency is another benefit: we can diagnose which models were important.
+
+Step 5: Wrapper Functions for Reusability
+In practice, we might want to wrap the TMLE procedure into convenient functions (similar to how the causalRisk package works with model specifications and estimation functions). Below we create simple wrapper functions to demonstrate this:
+
+estimate_tmle_effect(data, W_vars, A_var, Y_var, Q_lib, g_lib) – runs TMLE and returns the fitted object.
+summarize_tmle(tmle_fit) – produces a summary table of results (risks and effect estimates).
+
+```{r}
+# Wrapper function to run TMLE with specified variables and libraries
+estimate_tmle_effect <- function(data, W_vars, A_var, Y_var, Q_lib, g_lib) {
+  tmle_out <- tmle(Y = data[[Y_var]],
+                   A = data[[A_var]],
+                   W = data[, W_vars],
+                   Q.SL.library = Q_lib,
+                   g.SL.library = g_lib,
+                   family = "binomial")
+  return(tmle_out)
+}
+
+# Wrapper function to summarize TMLE results similar to causalRisk outputs
+summarize_tmle <- function(tmle_fit, digits = 1) {
+  EY0  <- mean(tmle_fit$Qstar[,1])
+  EY1  <- mean(tmle_fit$Qstar[,2])
+  RD   <- tmle_fit$estimates$ATE$psi
+  RD_ci <- tmle_fit$estimates$ATE$CI
+  RR   <- tmle_fit$estimates$RR$psi
+  RR_ci <- tmle_fit$estimates$RR$CI
+  res_tab <- data.frame(
+    Treatment = c("Untreated (A=0)", "Treated (A=1)", "Risk Difference", "Risk Ratio"),
+    `AKI Risk (6mo)` = c(
+      paste0(round(EY0*100, digits), "%"),
+      paste0(round(EY1*100, digits), "%"),
+      paste0(round(RD*100, digits), "%"),
+      paste0(round(RR, 2))
+    ),
+    `95% CI` = c(
+      paste0("(", round(EY0*100, digits), ", ", round(EY0*100, digits), ")"),  # trivial CI for point estimates (same value)
+      paste0("(", round(EY1*100, digits), ", ", round(EY1*100, digits), ")"),
+      paste0("(", round(RD_ci[1]*100, digits), ", ", round(RD_ci[2]*100, digits), ")"),
+      paste0("(", round(RR_ci[1], 2), ", ", round(RR_ci[2], 2), ")")
+    )
+  )
+  return(res_tab)
+}
+
+# Use the wrappers (for demonstration, same analysis as above)
+tmle_res <- estimate_tmle_effect(data, W_vars = c("age","diabetes","CKD"), 
+                                 A_var = "A", Y_var = "Y",
+                                 Q_lib = Q_lib, g_lib = g_lib)
+summarize_tmle(tmle_res)
+```
+
+
+The summarize_tmle function creates a data frame with rows for untreated risk, treated risk, risk difference, and risk ratio. The 95% CI for risks is not computed here (we would need the influence curve for each mean to get those), so we leave them as the point estimate repeated for now. The focus is on the RD and RR CIs which come from TMLE. This tabular format is similar to what causalRisk::make_table2 might produce for a point estimate at a given time.
+
+Note: In a true causalRisk usage for survival data, make_table2 would show cumulative incidence at a specific time for each group and differences. Here our outcome is already a 6-month outcome, so it's equivalent.
+
+Step 6: Optional Exercises for Further Exploration
+Finally, here are some optional exercises to solidify understanding and test the robustness of our analysis. These are not required to run for the main flow, but they provide insight if you're curious. Try them out and then check the provided answers/explanations:
+
+Exercise 6.1: Compare TMLE to a standard logistic regression.
+Fit a logistic regression of Y on A + age + diabetes + CKD. Compute the adjusted risk difference from the regression (e.g., by predicting $P(Y=1)$ if all treated vs all untreated). How does it compare to the TMLE estimate? Why might there be differences or similarities?
+
+<details><summary>Hint/Answer</summary> Using a logistic model, you can get predictions under $A=1$ and $A=0$. In our simulated data, the relationships were roughly linear in the logit, so a well-specified logistic regression should give a similar point estimate to TMLE. For example, you might find the regression-estimated risk difference is also around 2 percentage points. However, TMLE has the advantage of using an ensemble and the clever covariate adjustment, which can give slightly better calibration. If the regression was mis-specified (say we had a non-linear effect of age that we didn't include), TMLE with SL would likely perform better, whereas the simple regression could be biased.</details>
+Exercise 6.2: Test the impact of omitting a confounder.
+Re-run the TMLE analysis without including CKD in the W covariates (simulate the scenario of an unmeasured confounder). What happens to the estimated treatment effect?
+
+<details><summary>Hint/Answer</summary> If you drop a strong confounder like CKD from the adjustment, the treatment effect estimate will likely be biased. In this case, untreated patients have more CKD (high AKI risk), so not adjusting for CKD makes treated look artificially safer. You would expect the estimated risk difference to become more negative (or less positive). This shows how violation of the no-unmeasured-confounding assumption can distort results. TMLE cannot correct for an unmeasured confounder; ensuring all important confounders are included is crucial.</details>
+Exercise 6.3: Incorporate a new machine learning algorithm into SuperLearner.
+If you have the randomForest package installed, add "SL.randomForest" to the Q_lib and g_lib and rerun TMLE. Does the result change notably? (Set seed for fair comparison.) What does this say about our current model fits?
+
+<details><summary>Hint/Answer</summary> In many cases, adding a random forest might not change the estimate much if the sample is not extremely large or if the simpler models already fit well. If our outcome model was already captured by GLM/GAM, the SuperLearner may continue to favor those (the ensemble weight for RF could be low). If there were complex interactions, RF might improve fit and slightly adjust the estimate. The takeaway is that SuperLearner will choose the model (or mix) that best predicts the data; adding more models won't hurt the estimate, and can only help if they provide something new.</details>
+Conclusion
+In this workshop, we followed a step-by-step approach to perform a causal safety analysis in an RWE context:
+
+We formulated a causal question about an HCV treatment’s effect on AKI and chose the risk difference as the estimand.
+We simulated a dataset with realistic confounding and demonstrated why unadjusted comparisons can be misleading.
+We reviewed key assumptions (exchangeability, positivity, consistency) needed to identify the causal effect, and checked overlap of propensity scores to support the positivity assumption.
+We implemented TMLE with SuperLearner using the tlverse approach, leveraging machine learning to flexibly adjust for confounders. We also created simple wrapper functions akin to the causalRisk package for easier reuse.
+The analysis produced adjusted estimates of the treatment’s effect on AKI risk, which we interpreted in context. We saw how TMLE can reveal the true effect masked by confounding, and provide valid confidence intervals accounting for the complex modeling​
+RESEARCHONLINE.LSHTM.AC.UK
+.
+Through Q&A, we discussed interpretation and the rationale for using TMLE vs. traditional methods. Optional exercises helped reinforce these concepts and the importance of proper adjustment.
+By completing this vignette, you should now be more comfortable with the process of causal inference in a safety study: from question to assumptions to estimation and interpretation. The TMLE framework offers a powerful tool for RWE analyses, enabling us to make robust causal claims even in the face of high-dimensional data and potential model misspecification, as long as our assumptions hold.
+
+ütfen (In practice, always remember to scrutinize your assumptions and perform sensitivity analyses beyond what we’ve done here.)
+
+Happy targeted learning!
